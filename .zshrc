@@ -50,3 +50,8 @@ git config --global alias.type 'cat-file -t'
 git config --global alias.dump 'cat-file -p'
 git config --global alias.stashall 'stash --include-untracked'
 git config --global alias.loog 'log --graph --all --decorate --oneline'
+
+alias ll='ls -lGh'
+alias la='ls -Gah'
+alias l='ls -G'
+alias ls='ls -G'
