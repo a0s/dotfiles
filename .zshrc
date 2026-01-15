@@ -26,7 +26,7 @@ export LC_TIME="C.UTF-8"
 unset LC_ALL
 
 eval "$(starship init zsh)"
-eval "$(direnv hook zsh)"
+eval "$(direnv hook zsh)" && source ~/.direnvrc
 eval "$(pyenv init - zsh)"
 
 git config --global user.name "a0o"
