@@ -29,9 +29,6 @@ eval "$(starship init zsh)"
 eval "$(direnv hook zsh)" && source ~/.direnvrc
 eval "$(pyenv init - zsh)"
 
-git config --global user.name "a0o"
-git config --global user.email "a0s@gihub.com"
-
 git config --global color.diff.meta "yellow bold"
 git config --global color.diff.frag "magenta bold"
 git config --global color.diff.old "red bold"
@@ -55,3 +52,5 @@ alias ll='ls -lGah'
 alias la='ls -Gah'
 alias l='ls -G'
 alias ls='ls -G'
+
+export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
