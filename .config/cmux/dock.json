@@ -1,0 +1,13 @@
+{
+  "controls": [
+    {
+      "id": "agent-monitor",
+      "title": "Agents",
+      "command": "~/.config/cmux/bin/cmux-follow -- agent-monitor --short",
+      "height": 400,
+      "env": {
+        "AGENT_MONITOR_DOCK": "1"
+      }
+    }
+  ]
+}

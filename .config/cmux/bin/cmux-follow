@@ -1,0 +1,561 @@
+#!/usr/bin/python3
+"""
+cmux-follow - run a command, restarting it in the directory of the
+currently focused main-area terminal surface in cmux.
+
+Usage:
+  cmux-follow [options] -- <command> [args...]
+
+Options:
+  --interval <seconds>     Poll interval for focus/directory changes (default: 1.5)
+  --grace <seconds>        Grace period between SIGTERM and SIGKILL on restart (default: 3)
+  --retry-delay <seconds>  Delay before respawning a command that exited on its own,
+                            when the directory hasn't changed (default: 10)
+  --cmux <path>            Path to the cmux CLI (default: "cmux" on PATH)
+  --once                   Resolve the target directory once, print it as JSON, and exit
+                            (debugging aid; does not run the command)
+  -h, --help               Show this help and exit
+
+What it does:
+  Repeatedly asks cmux (via `cmux tree --json`) which main-area terminal surface
+  is focused - in the window this wrapper itself lives in, scoped to a single
+  workspace if the wrapper is running in a workspace-scoped Dock control, or to
+  the window's currently selected workspace if it is running in a global Dock
+  control (or standalone). Dock surfaces (including this one) are always
+  ignored when deciding what counts as "focused main-area surface"; while a
+  Dock pane has keyboard focus, cmux-follow keeps following the last known
+  main-area surface.
+
+  The resolved surface's working directory is read, in order of preference:
+    1. Through the surface's tty: the foreground process group on that tty is
+       found with `ps -t <tty>`, and its cwd is read with
+       `lsof -a -d cwd -p <pid>`. For a shell this is its current directory;
+       for an agent (claude, codex) it is the folder the agent was launched
+       from, which stays put when the agent's own shell tool runs `cd`.
+    2. Fallback: `cmux sessions --json --surface <id>` - the cwd cmux tracks
+       for a live Claude Code / Codex session on that surface.
+
+  When the resolved directory changes, the running child is stopped
+  (SIGTERM, then SIGKILL after --grace seconds if still alive), the screen is
+  cleared, and <command> is restarted with its cwd set to the new directory.
+  If the child exits on its own, cmux-follow does not busy-loop: it waits for
+  either a directory change or --retry-delay seconds before respawning it in
+  the same directory, printing a one-line status in the meantime.
+
+  The child always runs in the foreground of this wrapper's own terminal (no
+  pipes), so interactive TUIs, Ctrl-C, and terminal resizes work normally.
+
+Environment exposed to the child:
+  CMUX_FOLLOW_CWD              Resolved working directory
+  CMUX_FOLLOW_WORKSPACE_ID     UUID of the followed surface's workspace
+  CMUX_FOLLOW_WORKSPACE_TITLE  Title of that workspace
+  CMUX_FOLLOW_SURFACE_ID       UUID of the followed surface
+  CMUX_FOLLOW_SURFACE_TITLE    Title of the followed surface
+  CMUX_FOLLOW_TTY              tty device name of the followed surface, if any
+  CMUX_FOLLOW_SOURCE           How the cwd was resolved: "session" or "tty"
+"""
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+DEFAULT_INTERVAL = 1.5
+DEFAULT_GRACE = 3.0
+DEFAULT_RETRY_DELAY = 10.0
+
+
+def eprint(*a, **kw):
+    kw.setdefault("file", sys.stderr)
+    kw.setdefault("flush", True)
+    print(*a, **kw)
+
+
+def run_cmux(cmux_bin, args, timeout=10):
+    try:
+        out = subprocess.run(
+            [cmux_bin] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return None, str(e)
+    if out.returncode != 0:
+        return None, out.stderr.decode("utf-8", "replace").strip()
+    return out.stdout.decode("utf-8", "replace"), None
+
+
+def cmux_json(cmux_bin, args):
+    text, err = run_cmux(cmux_bin, args + ["--json", "--id-format", "both"])
+    if text is None:
+        return None, err
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as e:
+        return None, "bad json from cmux %s: %s" % (args, e)
+
+
+def window_key(win):
+    if not win:
+        return None
+    return win.get("id") or win.get("ref")
+
+
+def workspace_key(ws):
+    if not ws:
+        return None
+    return ws.get("id") or ws.get("ref")
+
+
+def surface_key(surf):
+    if not surf:
+        return None
+    return surf.get("id") or surf.get("ref")
+
+
+def walk_surfaces(obj, window_ctx=None, workspace_ctx=None, out=None):
+    """Recursively collect every surface-like dict in the tree, tagged with
+    the nearest enclosing window/workspace dicts it was found under."""
+    if out is None:
+        out = []
+    if isinstance(obj, dict):
+        new_window = window_ctx
+        new_workspace = workspace_ctx
+        if "workspaces" in obj and isinstance(obj.get("workspaces"), list):
+            new_window = obj
+        if "panes" in obj and isinstance(obj.get("panes"), list):
+            new_workspace = obj
+        if "tty" in obj or (obj.get("type") in ("terminal", "browser") and "ref" in obj):
+            out.append({"surface": obj, "window": new_window, "workspace": new_workspace})
+        for v in obj.values():
+            walk_surfaces(v, new_window, new_workspace, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            walk_surfaces(item, window_ctx, workspace_ctx, out)
+    return out
+
+
+class Resolver(object):
+    """Resolves the focused main-area surface + its cwd, remembering the
+    last known main-area surface per (window, workspace) so focus moving
+    into a Dock pane does not lose the target."""
+
+    def __init__(self, cmux_bin):
+        self.cmux_bin = cmux_bin
+        self._last_target = {}  # (window_key, workspace_key) -> surface dict
+
+    def resolve_target_surface(self):
+        self_id = os.environ.get("CMUX_SURFACE_ID")
+        tree, err = cmux_json(self.cmux_bin, ["tree", "--all"])
+        if tree is None:
+            return None, "cmux tree failed: %s" % err
+
+        entries = walk_surfaces(tree)
+        if not entries:
+            return None, "no surfaces found in cmux tree"
+
+        self_entry = None
+        if self_id:
+            for e in entries:
+                if surface_key(e["surface"]) == self_id:
+                    self_entry = e
+                    break
+
+        if self_entry is not None:
+            my_window = self_entry["window"]
+        else:
+            # Not addressable (e.g. run outside a cmux terminal) - fall back
+            # to the tree's reported "active" window.
+            my_window = None
+            active = tree.get("active") or {}
+            active_window_ref = active.get("window_ref")
+            for e in entries:
+                if window_key(e["window"]) == active_window_ref:
+                    my_window = e["window"]
+                    break
+
+        if my_window is None:
+            return None, "could not determine the window to follow"
+
+        wkey = window_key(my_window)
+        same_window = [e for e in entries if window_key(e["window"]) == wkey]
+
+        # Exclude Dock surfaces (this is what "never follow itself" means in
+        # practice: a Dock control is always tagged dock_scope, including
+        # this wrapper's own surface when it is actually run from a Dock).
+        candidates = [
+            e for e in same_window
+            if "dock_scope" not in e["surface"]
+        ]
+
+        # Decide workspace scope from our OWN surface's dock_scope, not from
+        # CMUX_WORKSPACE_ID (which is set in every cmux terminal, Dock or
+        # not, and so can't by itself tell "workspace-scoped Dock" apart
+        # from "an ordinary pane in some workspace"). A workspace-scoped
+        # Dock control (dock_scope == "workspace") follows only its own
+        # workspace. A global Dock control (dock_scope == "global"), or a
+        # standalone run outside any Dock, follows whichever workspace is
+        # currently selected in the window.
+        self_dock_scope = (self_entry or {}).get("surface", {}).get("dock_scope") if self_entry else None
+        my_ws_id = os.environ.get("CMUX_WORKSPACE_ID")
+        if self_dock_scope == "workspace" and my_ws_id:
+            chosen_ws_key = my_ws_id
+        else:
+            chosen_ws_key = my_window.get("selected_workspace_id") or my_window.get("selected_workspace_ref")
+
+        ws_candidates = [e for e in candidates if workspace_key(e["workspace"]) == chosen_ws_key]
+        if not ws_candidates:
+            # Workspace selection didn't line up with anything we found;
+            # widen to the whole window rather than following nothing.
+            ws_candidates = candidates
+
+        cache_key = (wkey, chosen_ws_key)
+
+        focused = [e for e in ws_candidates if e["surface"].get("focused")]
+        target = None
+        if len(focused) == 1:
+            target = focused[0]
+        elif len(focused) > 1:
+            sel = [e for e in focused if e["surface"].get("selected")]
+            target = sel[0] if sel else focused[0]
+        else:
+            sel = [e for e in ws_candidates if e["surface"].get("selected") or e["surface"].get("active")]
+            if len(sel) == 1:
+                target = sel[0]
+            elif sel:
+                target = sel[0]
+
+        if target is not None:
+            self._last_target[cache_key] = target
+            return target, None
+
+        cached = self._last_target.get(cache_key)
+        if cached is not None:
+            return cached, None
+
+        if ws_candidates:
+            return ws_candidates[0], None
+
+        return None, "no main-area surface found to follow"
+
+    def resolve_cwd(self, entry):
+        surf = entry["surface"]
+        sid = surface_key(surf)
+        ws = entry["workspace"] or {}
+        info = {
+            "surface_id": sid,
+            "surface_title": surf.get("title") or "",
+            "workspace_id": workspace_key(ws) or "",
+            "workspace_title": ws.get("title") or "",
+            "tty": surf.get("tty") or "",
+            "cwd": None,
+            "source": None,
+        }
+
+        # Process cwd first: for an agent pane this is the folder the agent was
+        # launched from (its project), which does not drift when the agent's own
+        # shell tool runs `cd`. The cmux-tracked session cwd is the fallback.
+        tty = surf.get("tty")
+        if tty:
+            cwd = self._cwd_from_tty(tty)
+            if cwd:
+                info["cwd"] = cwd
+                info["source"] = "tty"
+                return info
+
+        if sid:
+            sessions_json, _err = cmux_json(self.cmux_bin, ["sessions", "--surface", sid])
+            if sessions_json:
+                sessions = sessions_json.get("sessions") or []
+                sessions = [s for s in sessions if s.get("surface_id") == sid]
+                if sessions:
+                    sessions.sort(key=lambda s: s.get("updated_at_unix") or 0, reverse=True)
+                    cwd = sessions[0].get("cwd")
+                    if cwd:
+                        info["cwd"] = cwd
+                        info["source"] = "session"
+                        return info
+
+        return info
+
+    @staticmethod
+    def _cwd_from_tty(tty):
+        try:
+            out = subprocess.run(
+                ["ps", "-t", tty, "-o", "pid=,ppid=,pgid=,stat="],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if out.returncode != 0:
+            return None
+
+        procs = []
+        for line in out.stdout.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            stat = parts[3]
+            procs.append((pid, ppid, pgid, stat))
+        if not procs:
+            return None
+
+        fg = [p for p in procs if "+" in p[3]]
+        pool = fg if fg else procs
+        # Prefer the highest-pgid foreground group (the most recently
+        # started foreground job), and within it, the process group leader.
+        pool.sort(key=lambda p: p[2])
+        best_pgid = pool[-1][2]
+        group = [p for p in pool if p[2] == best_pgid]
+        leader = [p for p in group if p[0] == p[2]]
+        pick = leader[0] if leader else group[-1]
+        pid = pick[0]
+
+        cwd = Resolver._cwd_from_pid(pid)
+        if cwd:
+            return cwd
+        # Fall back to the oldest process on the tty (usually the login
+        # shell), in case lsof on the foreground job failed (permissions,
+        # already exited, etc).
+        procs.sort(key=lambda p: p[0])
+        for p in procs:
+            if p[0] == pid:
+                continue
+            cwd = Resolver._cwd_from_pid(p[0])
+            if cwd:
+                return cwd
+        return None
+
+    @staticmethod
+    def _cwd_from_pid(pid):
+        try:
+            out = subprocess.run(
+                ["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if out.returncode != 0:
+            return None
+        for line in out.stdout.decode("utf-8", "replace").splitlines():
+            if line.startswith("n"):
+                path = line[1:]
+                if path and os.path.isdir(path):
+                    return path
+        return None
+
+
+class Follower(object):
+    def __init__(self, command, interval, grace, retry_delay, cmux_bin):
+        self.command = command
+        self.interval = interval
+        self.grace = grace
+        self.retry_delay = retry_delay
+        self.resolver = Resolver(cmux_bin)
+        self.child = None
+        self.current_info = None
+        self.exited_at = None
+        self._stopping = False
+
+    def _env_for(self, info):
+        env = dict(os.environ)
+        env["CMUX_FOLLOW_CWD"] = info["cwd"] or ""
+        env["CMUX_FOLLOW_WORKSPACE_ID"] = info["workspace_id"] or ""
+        env["CMUX_FOLLOW_WORKSPACE_TITLE"] = info["workspace_title"] or ""
+        env["CMUX_FOLLOW_SURFACE_ID"] = info["surface_id"] or ""
+        env["CMUX_FOLLOW_SURFACE_TITLE"] = info["surface_title"] or ""
+        env["CMUX_FOLLOW_TTY"] = info["tty"] or ""
+        env["CMUX_FOLLOW_SOURCE"] = info["source"] or ""
+        return env
+
+    def _clear_screen(self):
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.flush()
+
+    def _status(self, msg):
+        eprint("\033[2m[cmux-follow]\033[0m %s" % msg)
+
+    def _spawn(self, info):
+        self._clear_screen()
+        self._status(
+            "-> %s (workspace %s) :: %s" % (
+                info["cwd"], info["workspace_title"] or info["workspace_id"], " ".join(self.command)
+            )
+        )
+        env = self._env_for(info)
+        self.current_info = info
+        try:
+            self.child = subprocess.Popen(self.command, cwd=info["cwd"] or None, env=env)
+        except OSError as exc:
+            # Command missing from PATH, unreadable cwd, etc.: stay alive and retry.
+            self.child = None
+            self.exited_at = time.time()
+            self._status(
+                "cannot start %s: %s; will retry on directory change or in %.0fs"
+                % (self.command[0], exc.strerror or exc, self.retry_delay)
+            )
+            return
+        self.exited_at = None
+
+    def _stop_child(self):
+        if self.child is None:
+            return
+        if self.child.poll() is not None:
+            self.child = None
+            return
+        try:
+            self.child.terminate()
+        except OSError:
+            pass
+        deadline = time.time() + self.grace
+        while time.time() < deadline:
+            if self.child.poll() is not None:
+                break
+            time.sleep(0.1)
+        if self.child.poll() is None:
+            try:
+                self.child.kill()
+            except OSError:
+                pass
+            try:
+                self.child.wait(timeout=self.grace)
+            except subprocess.TimeoutExpired:
+                pass
+        self.child = None
+
+    def shutdown(self):
+        self._stopping = True
+        self._stop_child()
+
+    def run(self):
+        target, err = self.resolver.resolve_target_surface()
+        if target is None:
+            self._status("waiting for a focused surface to follow (%s)" % err)
+        else:
+            info = self.resolver.resolve_cwd(target)
+            if info["cwd"]:
+                self._spawn(info)
+            else:
+                self._status("could not resolve a directory yet, retrying")
+
+        while not self._stopping:
+            try:
+                if self.child is not None:
+                    try:
+                        self.child.wait(timeout=self.interval)
+                        code = self.child.returncode
+                        self.child = None
+                        self.exited_at = time.time()
+                        self._status(
+                            "command exited (code %s); will restart on directory change or in %.0fs"
+                            % (code, self.retry_delay)
+                        )
+                    except subprocess.TimeoutExpired:
+                        pass
+                else:
+                    time.sleep(self.interval)
+            except KeyboardInterrupt:
+                break
+
+            target, err = self.resolver.resolve_target_surface()
+            if target is None:
+                continue
+            info = self.resolver.resolve_cwd(target)
+            if not info["cwd"]:
+                continue
+
+            dir_changed = (
+                self.current_info is None
+                or info["cwd"] != self.current_info["cwd"]
+            )
+
+            if dir_changed:
+                self._stop_child()
+                self._spawn(info)
+            elif self.child is None and self.exited_at is not None:
+                if time.time() - self.exited_at >= self.retry_delay:
+                    self._spawn(info)
+
+
+def parse_args(argv):
+    interval = DEFAULT_INTERVAL
+    grace = DEFAULT_GRACE
+    retry_delay = DEFAULT_RETRY_DELAY
+    cmux_bin = "cmux"
+    once = False
+    i = 0
+    command = None
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        elif a == "--interval":
+            i += 1
+            interval = float(argv[i])
+        elif a == "--grace":
+            i += 1
+            grace = float(argv[i])
+        elif a == "--retry-delay":
+            i += 1
+            retry_delay = float(argv[i])
+        elif a == "--cmux":
+            i += 1
+            cmux_bin = argv[i]
+        elif a == "--once":
+            once = True
+        elif a == "--":
+            command = argv[i + 1:]
+            break
+        else:
+            eprint("cmux-follow: unknown option %r (use -- before the command)" % a)
+            sys.exit(2)
+        i += 1
+
+    if not once and not command:
+        eprint("cmux-follow: missing command. Usage: cmux-follow [options] -- <command> [args...]")
+        sys.exit(2)
+
+    return interval, grace, retry_delay, cmux_bin, once, (command or [])
+
+
+def main():
+    interval, grace, retry_delay, cmux_bin, once, command = parse_args(sys.argv[1:])
+
+    if once:
+        resolver = Resolver(cmux_bin)
+        target, err = resolver.resolve_target_surface()
+        if target is None:
+            print(json.dumps({"error": err}))
+            sys.exit(1)
+        info = resolver.resolve_cwd(target)
+        print(json.dumps(info, indent=2))
+        sys.exit(0)
+
+    follower = Follower(command, interval, grace, retry_delay, cmux_bin)
+
+    def handle_signal(signum, frame):
+        follower.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGHUP, handle_signal)
+
+    try:
+        follower.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        follower.shutdown()
+
+
+if __name__ == "__main__":
+    main()

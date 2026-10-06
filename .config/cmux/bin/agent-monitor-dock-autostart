@@ -1,0 +1,30 @@
+#!/bin/zsh
+# Sourced from ~/.zshrc. cmux seeds Dock controls from dock.json only once;
+# after a relaunch it restores the Dock from its session snapshot as a plain
+# shell, without the control's command. This re-launches agent-monitor in that
+# restored shell: only in the first terminal of a window's global Dock, and not
+# in the fallback shell cmux opens after the monitor exits (that shell inherits
+# AGENT_MONITOR_DOCK=1 from the dock.json control env).
+
+[[ -o interactive && -n $CMUX_SURFACE_ID && -z $AGENT_MONITOR_DOCK ]] || return 0
+
+() {
+  local cmux=${CMUX_BUNDLED_CLI_PATH:-cmux}
+  local verdict
+  verdict=$("$cmux" tree --json --id-format both 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+me = sys.argv[1]
+def walk(o):
+    if isinstance(o, dict):
+        if o.get("dock_scope") == "global" and o.get("type") == "terminal":
+            # the first global Dock terminal found decides
+            print("yes" if o.get("id") == me else "no"); sys.exit()
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(json.load(sys.stdin))
+' "$CMUX_SURFACE_ID" 2>/dev/null)
+  [[ $verdict == yes ]] || return 0
+  export AGENT_MONITOR_DOCK=1
+  "$HOME/.config/cmux/bin/cmux-follow" -- agent-monitor --short
+}
