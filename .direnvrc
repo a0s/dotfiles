@@ -16,7 +16,6 @@ export_alias() {
     PATH_add "$alias_dir"
   fi
 
-  # Строим exec-команду вручную с правильным экранированием
   {
     echo '#!/usr/bin/env bash'
     echo 'set -e'
@@ -29,6 +28,9 @@ export_alias() {
   chmod +x "$alias_file"
 }
 
+# How to use:
+# myfunc() { echo "Hello $1"; }
+# export_function myfunc
 export_function() {
   local name=$1
   local alias_dir=$PWD/.direnv/aliases
@@ -42,4 +44,11 @@ export_function() {
     echo "$name \$*" >> "$target"
     chmod +x "$target"
   fi
+}
+
+# Set the iTerm2 color preset for the current directory.
+# Auto-reverts to the default preset when leaving the dir.
+# Usage inside .envrc:  iterm_theme "Solarized Dark"
+iterm_theme() {
+  export ITERM_THEME="$1"
 }
