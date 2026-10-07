@@ -1,0 +1,25 @@
+# --- Theme: порт iTerm2-пресетов Claude Light / Claude Dark (~/.config/ghostty/themes)
+theme = light:Claude Light,dark:Claude Dark
+
+# --- Font (как в iTerm2: RobotoMono NF 14)
+font-family = RobotoMono Nerd Font Mono
+# 11.67 = 14pt после globalFontMagnification 120% в cmux.json
+font-size = 11.67
+font-thicken = true
+adjust-cell-height = 10%
+
+# --- cmux chrome
+sidebar-font-size = 13
+surface-tab-bar-font-size = 12
+
+# --- Window / panes
+window-padding-x = 12
+window-padding-y = 8
+window-padding-balance = true
+unfocused-split-opacity = 0.85
+split-divider-color = #3a3936
+cursor-style = bar
+cursor-style-blink = false
+mouse-hide-while-typing = true
+copy-on-select = false
+working-directory = home
