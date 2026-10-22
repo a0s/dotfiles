@@ -25,5 +25,10 @@
     "matchTerminalBackground": true
   },
 
-  "activePaneBorderColor": "#d97757"
+  "activePaneBorderColor": "#d97757",
+
+  "automation": {
+    // allow external processes to drive cmux over the socket
+    "socketControlMode": "automation"
+  }
 }
