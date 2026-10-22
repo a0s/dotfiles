@@ -69,7 +69,7 @@ ignore them via `~/.dotfiles/info/exclude`:
 |---|---|
 | A shell setting every machine wants | `~/.zshrc.d/NN-name.zsh`, committed |
 | A PATH tweak, dev checkout, work tool | `~/.zshrc.d/NN-name.local.zsh`, local only |
-| cmux actions, workspaces, private shortcuts | `~/.config/cmux/local/cmux.pack.json`, loaded through `"packs": ["local"]`; a missing pack is simply skipped |
+| cmux actions, workspaces, private shortcuts | `~/.config/cmux/local/cmux.pack.json`, loaded through `"packs": ["local"]`; cmux reports a missing pack as a config error, so on a new machine create it, even empty: `{ "actions": {} }` |
 
 Fragments load in lexical order, so the number decides precedence. For
 example, a development checkout is put on `PATH` by a `65-*.local.zsh`

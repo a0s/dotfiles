@@ -1,18 +1,29 @@
-git config --global color.diff.meta "yellow bold"
-git config --global color.diff.frag "magenta bold"
-git config --global color.diff.old "red bold"
-git config --global color.diff.new "green bold"
+# Git colors and aliases. Written to ~/.gitconfig only when missing or different:
+# unconditional `git config --global` in every new shell races for the lock when
+# cmux restores several tabs at once ("could not lock config file").
+() {
+  local -A want=(
+    color.diff.meta         'yellow bold'
+    color.diff.frag         'magenta bold'
+    color.diff.old          'red bold'
+    color.diff.new          'green bold'
 
-git config --global color.status.added yellow
-git config --global color.status.changed green
-git config --global color.status.untracked cyan
+    color.status.added      yellow
+    color.status.changed    green
+    color.status.untracked  cyan
 
-git config --global alias.co checkout
-git config --global alias.ci commit
-git config --global alias.st 'status --ignore-submodules'
-git config --global alias.br branch
-git config --global alias.hist 'log --pretty=format:"%h %ad | %s%d [%an]" --graph --date=short'
-git config --global alias.type 'cat-file -t'
-git config --global alias.dump 'cat-file -p'
-git config --global alias.stashall 'stash --include-untracked'
-git config --global alias.loog 'log --graph --all --decorate --oneline'
+    alias.co        checkout
+    alias.ci        commit
+    alias.st        'status --ignore-submodules'
+    alias.br        branch
+    alias.hist      'log --pretty=format:"%h %ad | %s%d [%an]" --graph --date=short'
+    alias.type      'cat-file -t'
+    alias.dump      'cat-file -p'
+    alias.stashall  'stash --include-untracked'
+    alias.loog      'log --graph --all --decorate --oneline'
+  )
+  local nl=$'\n' have="$nl$(git config --global --list 2>/dev/null)$nl" k
+  for k in ${(k)want}; do
+    [[ $have == *"$nl$k=${want[$k]}$nl"* ]] || git config --global $k ${want[$k]}
+  done
+}
